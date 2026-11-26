@@ -14,6 +14,14 @@ import os
 import random
 import sys
 import time
+import json
+
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # jangan dibesarkan Windows
+    except Exception:
+        pass
 
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 
@@ -46,14 +54,16 @@ SIGMA = 0.5               # makin kecil = penilaian makin ketat
 PW, PH = 320, 400         # ukuran gambar contoh di tengah
 NAME_MAX = 12
 WIN = "Pose Battle"
-SENSOR_ON = True          # True = sensor aktif | False = mode TEST (skor acak)
+SENSOR_ON = False          # True = sensor aktif | False = mode TEST (skor acak)
 FONT = cv2.FONT_HERSHEY_DUPLEX
 P_COLORS = [(255, 200, 0), (180, 90, 255)]
 GOLD = (0, 215, 255)
 ANGLE_TOL = 40.0  
-
 TILT_FORGIVE = 8.0        # selisih kemiringan bahu yang dimaafkan (derajat)
 SCORE_WINDOW = 1.0        # skor diambil dari N detik terakhir (median)
+ANGLE_FORGIVE = 12.0      # selisih arah anggota badan yang dianggap sempurna (derajat)
+POS_FORGIVE = 0.15        # selisih posisi siku/tangan yang dianggap sempurna (satuan lebar bahu)
+BASE_CAP = 0.6            # batas pengurangan skor "diam" (supaya pose mirip berdiri tidak jadi terlalu sensitif)
 
 # ======================= PENGATURAN SUARA =======================
 SOUND_ON = True           # False = matikan semua suara
@@ -75,7 +85,7 @@ MUSIC_FILES = {
 }
 # musik yang diputar di tiap layar (None = tanpa musik)
 MUSIC_STATE = {
-    "MENU": "menu", "NAMES": "menu", "WAIT": "menu",
+    "SPLASH": "menu", "MENU": "menu", "NAMES": "menu", "WAIT": "menu", "SETTINGS": "menu",
     "COUNTDOWN": "main", "POSE": "main", "RESULT": "main",
     "FINAL": "leaderboard", "PLAYBACK": None,
 }
@@ -107,6 +117,24 @@ LIMBS = [(5, 7), (7, 9), (6, 8), (8, 10), (11, 13), (13, 15), (12, 14),
 
 
 # ======================= SUARA =======================
+SETTINGS_FILE = "settings.json"
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return bool(d.get("music", True)), bool(d.get("sfx", True))
+    except Exception:
+        return True, True
+
+
+def save_settings(music, sfx):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"music": music, "sfx": sfx}, fh)
+    except Exception:
+        pass
+
 def find_sound(base):
     for ext in (".wav", ".mp3", ".ogg"):
         p = os.path.join(SOUND_DIR, base + ext)
@@ -121,6 +149,7 @@ class Audio:
     def __init__(self):
         self.ok = False
         self.sfx, self.music, self.cur = {}, {}, "?"
+        self.music_on, self.sfx_on = load_settings()
         if not SOUND_ON or pygame is None:
             return
         try:
@@ -151,12 +180,8 @@ class Audio:
                 print(f"[musik] tidak ada: {SOUND_DIR}/{base}.wav/.mp3/.ogg")
 
     def play(self, key):
-        if self.ok and key in self.sfx:
+        if self.ok and self.sfx_on and key in self.sfx:
             self.sfx[key].play()
-
-    def stop_sfx(self):
-        if self.ok:
-            pygame.mixer.stop()
 
     def set_music(self, key):
         """Ganti musik latar (tidak mengulang dari awal kalau musiknya sama)."""
@@ -165,13 +190,27 @@ class Audio:
         self.cur = key
         try:
             pygame.mixer.music.stop()
-            if key and key in self.music:
+            if self.music_on and key and key in self.music:
                 pygame.mixer.music.load(self.music[key])
                 pygame.mixer.music.set_volume(MUSIC_VOL)
                 pygame.mixer.music.play(-1)
         except Exception as e:
             print("[!] Musik gagal diputar:", e)
 
+    def set_music_on(self, on):
+        self.music_on = on
+        self.cur = "?"                       # paksa musik layar ini dimuat ulang / dihentikan
+        if self.ok and not on:
+            pygame.mixer.music.stop()
+
+    def set_sfx_on(self, on):
+        self.sfx_on = on
+        if self.ok and not on:
+            pygame.mixer.stop()              # hentikan efek yang sedang bunyi (musik tidak terpengaruh)
+            
+    def stop_sfx(self):
+        if self.ok:
+            pygame.mixer.stop()
     def close(self):
         if self.ok:
             pygame.mixer.quit()
@@ -201,23 +240,25 @@ NEUTRAL[15], NEUTRAL[16] = (0.37, 3.7), (-0.37, 3.7)
 
 SCORED_LIMBS = [(5, 7), (7, 9), (6, 8), (8, 10), (11, 13), (13, 15), (12, 14), (14, 16)]
 
-
 def _adiff(v1, v2):
     """Selisih arah dua vektor dalam derajat (0-180)."""
     a = math.degrees(math.atan2(v1[1], v1[0]) - math.atan2(v2[1], v2[0]))
     return abs((a + 180) % 360 - 180)
 
 
-def similarity(ref_kp, ref_conf, kp, conf):
-    """Skor 0-100. Bagian tubuh yang di gambar BEDA dari posisi berdiri biasa
-    bobotnya besar; bagian yang cuma berdiri lurus bobotnya kecil.
-    Jadi orang yang diam saja skornya rendah."""
+def _soft(d, forgive, tol):
+    """1.0 kalau selisih <= forgive, lalu turun halus."""
+    return 1.0 if d <= forgive else math.exp(-((d - forgive) / tol) ** 2)
+
+
+def _raw_sim(ref_kp, ref_conf, kp, conf):
+    """Skor mentah 0..1."""
     r, rv = normalize(ref_kp, ref_conf)
     p, pv = normalize(kp, conf)
     if r is None or p is None:
         return 0.0
 
-    # 1) arah anggota badan (proporsi tubuh tidak berpengaruh)
+    # 1) arah anggota badan
     num = den = 0.0
     for a, b in SCORED_LIMBS:
         if not (rv[a] and rv[b]):
@@ -230,35 +271,45 @@ def similarity(ref_kp, ref_conf, kp, conf):
         if pv[a] and pv[b]:
             vp = p[b] - p[a]
             if np.linalg.norm(vp) > 1e-6:
-                s = math.exp(-(_adiff(vr, vp) / ANGLE_TOL) ** 2)
+                s = _soft(_adiff(vr, vp), ANGLE_FORGIVE, ANGLE_TOL)
         num += w * s
         den += w
     ang_score = num / den if den else 0.0
 
-    # 2) posisi siku & tangan relatif terhadap bahu
+    # 2) posisi siku & tangan
     pn = pd = 0.0
     for i in (7, 8, 9, 10):
         if not rv[i]:
             continue
         w = 0.1 + min(1.0, float(np.linalg.norm(r[i] - NEUTRAL[i])) / 0.8)
-        s = math.exp(-(float(np.linalg.norm(r[i] - p[i])) / SIGMA) ** 2) if pv[i] else 0.0
+        s = _soft(float(np.linalg.norm(r[i] - p[i])), POS_FORGIVE, SIGMA) if pv[i] else 0.0
         pn += w * s
         pd += w
     pos_score = pn / pd if pd else 0.0
 
-    # 3) kemiringan bahu: hanya dihitung kalau di gambar memang miring
+    # 3) kemiringan bahu (hanya kalau di gambar memang miring)
     def _tilt(q):
         return math.degrees(math.atan2(q[5][1] - q[6][1], q[5][0] - q[6][0]))
     rt = _tilt(r)
     wt = min(1.0, abs(rt) / 20.0)
-    d = max(0.0, abs((rt - _tilt(p) + 180) % 360 - 180) - TILT_FORGIVE)
-    tilt_score = math.exp(-(d / 25.0) ** 2)
+    d = abs((rt - _tilt(p) + 180) % 360 - 180)
+    tilt_score = _soft(d, TILT_FORGIVE, 25.0)
 
     total = (0.65 * ang_score + 0.35 * pos_score + wt * tilt_score) / (1.0 + wt)
-
-    # titik yang tidak terlihat mengurangi skor (tidak bisa sempurna kalau tubuh terpotong)
     vis = float(np.mean([pv[i] for i in range(7, 17)]))
-    return float(100 * total * (0.85 + 0.15 * vis))
+    return total * (0.85 + 0.15 * vis)
+
+
+def idle_baseline(ref_kp, ref_conf):
+    """Skor mentah orang yang berdiri diam terhadap pose ini."""
+    return min(_raw_sim(ref_kp, ref_conf, NEUTRAL, np.ones(17)), BASE_CAP)
+
+
+def similarity(ref_kp, ref_conf, kp, conf, base=0.0):
+    """Skor 0-100. Berdiri diam = 0, meniru dengan benar = 100."""
+    raw = _raw_sim(ref_kp, ref_conf, kp, conf)
+    s = (raw - base) / max(1e-6, 1.0 - base)
+    return float(100 * min(1.0, max(0.0, s)))
 
 def body_visible(p):
     kp, c = p["kp"], p["conf"]
@@ -309,18 +360,140 @@ def fit_frame(img):
     return cv2.resize(img, (W, H))
 
 
+# ======================= TEMA LANGIT BIRU =======================
+SKY_TOP, SKY_MID, SKY_BOT = (244, 155, 43), (255, 200, 124), (255, 235, 205)   # BGR
+NAVY, BLUE, GOLDC = (107, 60, 11), (192, 101, 21), (60, 201, 255)
+GREEN_ON, GRAY_OFF = (50, 125, 46), (174, 164, 144)
+CLOUDS = [(90, 70, 220, 70, 0.0), (1000, 160, 260, 80, 2.0), (150, 560, 180, 58, 4.0), (960, 600, 230, 70, 1.0)]
+
+
+def lerp_c(a, b, t):
+    t = min(1.0, max(0.0, t))
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def ease_back(t):
+    """Membesar sedikit melewati target lalu kembali (efek memantul)."""
+    t = min(1.0, max(0.0, t))
+    c1 = 1.70158
+    c3 = c1 + 1
+    return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2
+
+
+def fill_pill(img, x, y, w, h, col):
+    r = h // 2
+    cv2.rectangle(img, (x + r, y), (x + w - r, y + h), col, -1)
+    cv2.circle(img, (x + r, y + r), r, col, -1, cv2.LINE_AA)
+    cv2.circle(img, (x + w - r, y + r), r, col, -1, cv2.LINE_AA)
+
+
+def pill(img, x, y, w, h, col, border=None, bw=0):
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    if border is not None:
+        fill_pill(img, x, y, w, h, border)
+        fill_pill(img, x + bw, y + bw, w - 2 * bw, h - 2 * bw, col)
+    else:
+        fill_pill(img, x, y, w, h, col)
+
+
+def fill_round(img, x, y, w, h, r, col):
+    cv2.rectangle(img, (x + r, y), (x + w - r, y + h), col, -1)
+    cv2.rectangle(img, (x, y + r), (x + w, y + h - r), col, -1)
+    for cx, cy in ((x + r, y + r), (x + w - r, y + r), (x + r, y + h - r), (x + w - r, y + h - r)):
+        cv2.circle(img, (cx, cy), r, col, -1, cv2.LINE_AA)
+
+
+def title_text(img, s, cx, cy, scale=2.0, fill=(255, 255, 255), th=5, center=True, x=None):
+    """Teks judul: isi putih/emas, garis tepi navy, bayangan di bawah."""
+    (tw, tt), _ = cv2.getTextSize(s, FONT, scale, th)
+    x0 = int(cx - tw / 2) if center else int(x)
+    y0 = int(cy + tt / 2)
+    cv2.putText(img, s, (x0, y0 + 8), FONT, scale, NAVY, th + 9, cv2.LINE_AA)
+    cv2.putText(img, s, (x0, y0), FONT, scale, NAVY, th + 9, cv2.LINE_AA)
+    cv2.putText(img, s, (x0, y0), FONT, scale, fill, th, cv2.LINE_AA)
+
+
+def title_pose_battle(img, cy, scale, th):
+    (w1, _), _ = cv2.getTextSize("POSE ", FONT, scale, th)
+    (w2, _), _ = cv2.getTextSize("BATTLE", FONT, scale, th)
+    x = W // 2 - (w1 + w2) // 2
+    title_text(img, "POSE ", 0, cy, scale, (255, 255, 255), th, False, x)
+    title_text(img, "BATTLE", 0, cy, scale, GOLDC, th, False, x + w1)
+
+
+def draw_logo(img, cx, cy, r, rot=0.0):
+    """Logo: lingkaran biru bergambar orang berpose."""
+    if r < 4:
+        return
+    cv2.circle(img, (cx, cy + int(r * 0.07)), r + 2, NAVY, -1, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), r, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), int(r * 0.9), BLUE, -1, cv2.LINE_AA)
+    k = r / 95.0
+    c, s = math.cos(rot), math.sin(rot)
+    P = lambda px, py: (int(cx + (px * c - py * s) * k), int(cy + (px * s + py * c) * k))
+    th = max(2, int(9 * k))
+    for a, b in (((0, -15), (0, 17)), ((0, -7), (-27, -27)), ((0, -7), (27, -27)),
+                 ((0, 17), (-17, 45)), ((0, 17), (17, 45))):
+        cv2.line(img, P(*a), P(*b), (255, 255, 255), th, cv2.LINE_AA)
+    cv2.circle(img, P(0, -31), max(2, int(13 * k)), GOLDC, -1, cv2.LINE_AA)
+
+
+class Sky:
+    """Latar langit biru polos dengan garis diagonal yang bergerak dan awan melayang."""
+
+    def __init__(self):
+        t = np.linspace(0, 1, H)
+        col = np.zeros((H, 3))
+        for c in range(3):
+            col[:, c] = np.interp(t, [0, 0.55, 1], [SKY_TOP[c], SKY_MID[c], SKY_BOT[c]])
+        self.base = np.repeat(col[:, None, :], W, axis=1).astype(np.uint8)
+        self.light = (self.base.astype(np.float32) * 0.86 + 255 * 0.14).astype(np.uint8)
+        yy, xx = np.mgrid[0:H, 0:W]
+        self.xy = (xx + yy).astype(np.int32)
+
+    def draw(self):
+        t = time.time()
+        mask = (((self.xy + int((t * 40) % 120)) // 60) & 1) == 0
+        img = np.where(mask[..., None], self.light, self.base).astype(np.uint8)
+        for bx, by, w, h, ph in CLOUDS:
+            m = math.sin(t * 0.9 + ph)
+            fill_pill(img, int(bx + 24 * m), int(by - 14 * m), w, h, (255, 250, 245))
+        return img
+
+
 class Button:
+    """Tombol pil: berubah emas + naik saat kursor di atasnya, memantul saat diklik."""
+
     def __init__(self, label, x, y, w, h, color):
         self.label, self.x, self.y, self.w, self.h, self.color = label, x, y, w, h, color
+        self.hov = 0.0
+        self.press_t = -1.0
 
     def hit(self, p):
         return p is not None and self.x <= p[0] <= self.x + self.w and self.y <= p[1] <= self.y + self.h
 
     def draw(self, img, mouse):
-        c = tuple(min(255, int(v * 1.25)) for v in self.color) if self.hit(mouse) else self.color
-        cv2.rectangle(img, (self.x, self.y), (self.x + self.w, self.y + self.h), c, -1)
-        cv2.rectangle(img, (self.x, self.y), (self.x + self.w, self.y + self.h), (255, 255, 255), 3)
-        put(img, self.label, (self.x + self.w // 2, self.y + self.h // 2), 1.0, (255, 255, 255), 2, True)
+        over = self.hit(mouse)
+        self.hov += ((1.0 if over else 0.0) - self.hov) * 0.25          # transisi halus
+        hv = self.hov
+        sc, dy = 1 + 0.04 * hv, -6 * hv
+        pt = time.time() - self.press_t if self.press_t > 0 else 9
+        press = 0.0
+        if pt < 0.3:                                                   # animasi klik
+            press = math.sin(pt / 0.3 * math.pi)
+            sc *= 1 - 0.10 * press
+            dy += 8 * press
+        w2, h2 = int(self.w * sc), int(self.h * sc)
+        x2 = self.x + (self.w - w2) // 2
+        y2 = self.y + (self.h - h2) // 2 + int(dy)
+        fill = lerp_c(self.color, GOLDC, hv)
+        shadow = tuple(int(v * 0.5) for v in self.color)
+        pill(img, x2, y2 + int(9 - 7 * press + 5 * hv), w2, h2, shadow)
+        pill(img, x2, y2, w2, h2, fill, (255, 255, 255), 5)
+        tcol = lerp_c((255, 255, 255), NAVY, hv)
+        (tw, th), _ = cv2.getTextSize(self.label, FONT, 1.0, 2)
+        cv2.putText(img, self.label, (x2 + (w2 - tw) // 2, y2 + (h2 + th) // 2),
+                    FONT, 1.0, tcol, 2, cv2.LINE_AA)
 
 
 # ======================= ALAT BANTU: CARI KOORDINAT =======================
@@ -427,8 +600,11 @@ def load_references(model):
         if got is None:
             print(f"[!] {fname}: tidak ada di pose_points.py & orang tidak terdeteksi, dilewati.")
             continue
-        print(f"[ok] {fname}  (titik dari {src})")
-        refs.append({"name": name, "kp": got[0], "conf": got[1],
+        base = idle_baseline(got[0], got[1])
+        print(f"[ok] {fname}  (titik dari {src})  mirip-berdiri={base:.2f}")
+        if base >= 0.5:
+            print(f"     [!] {fname} mirip berdiri biasa, orang diam bisa dapat skor lumayan. Sebaiknya dibuang.")
+        refs.append({"name": name, "kp": got[0], "conf": got[1], "base": base,
                      "panel": make_image_panel(img, name)})
     return refs
 
@@ -509,14 +685,19 @@ class PoseBattle:
             raise SystemExit("Webcam tidak ditemukan.")
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
+        self.disp = (W, H)        # ukuran gambar yang benar-benar tampil di jendela
         cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WIN, W, H)
         cv2.setMouseCallback(WIN, self.on_mouse)
         self.mouse, self.click = (0, 0), None
         self.fullscreen = False
         self.quit = False
-        self.state = "MENU"
+        self.state = "SPLASH"
+        self.sky = Sky()
+        self.pending = None                 # aksi tombol yang menunggu animasi klik selesai
+        self.last_state = None
+        self.enter_t = time.time()
+        self.sw_p = {}                      # posisi animasi saklar
         self.writer = None
         self.rec_path = None
         self.snap_dir = None
@@ -532,8 +713,12 @@ class PoseBattle:
         self.active = 0
         self.cam_x = [W * 0.25, W * 0.75]
 
-        self.btn_play = Button("PLAY", W // 2 - 160, 400, 320, 80, (60, 170, 60))
-        self.btn_quit = Button("KELUAR", W // 2 - 160, 500, 320, 70, (60, 60, 170))
+        self.btn_play = Button("PLAY", W // 2 - 220, 320, 440, 80, BLUE)
+        self.btn_settings = Button("PENGATURAN", W // 2 - 220, 425, 440, 80, BLUE)
+        self.btn_quit = Button("KELUAR", W // 2 - 220, 530, 440, 80, (40, 40, 198))
+        self.btn_music = Button("", W // 2 + 138, 275 - 32, 132, 64, BLUE)    # hanya area klik saklar
+        self.btn_sfx = Button("", W // 2 + 138, 375 - 32, 132, 64, BLUE)
+        self.btn_setback = Button("KEMBALI", W // 2 - 150, 500, 300, 76, BLUE)
         self.btn_cancel = Button("BATAL", 40, 630, 200, 60, (60, 60, 170))
         self.btn_replay = Button("REKAMAN", 55, 620, 270, 70, (170, 110, 40))
         self.btn_again = Button("MAIN LAGI", 355, 620, 270, 70, (60, 170, 60))
@@ -544,17 +729,21 @@ class PoseBattle:
         self.btn_menu = Button("KEMBALI", W // 2 - 300, 560, 280, 80, (60, 60, 170))
         self.field_rects = [(W // 2 - 300, 220, 600, 70), (W // 2 - 300, 370, 600, 70)]
         self.reset_game()
+        self.splash_t0 = time.time()
 
     # ---------- input ----------
     def on_mouse(self, event, x, y, flags, param):
+        dw, dh = self.disp
+        x, y = int(x * W / dw), int(y * H / dh)       # kembalikan ke koordinat 1280x720
         self.mouse = (x, y)
         if event == cv2.EVENT_LBUTTONDOWN:
             self.click = (x, y)
-
+            
     def click_on_button(self):
         """True jika klik terakhir mengenai tombol di layar yang sedang tampil."""
         bs = {
-            "MENU": [self.btn_play, self.btn_quit],
+            "MENU": [self.btn_play, self.btn_settings, self.btn_quit],
+            "SETTINGS": [self.btn_music, self.btn_sfx, self.btn_setback],
             "NAMES": [self.btn_menu, self.btn_start],
             "WAIT": [self.btn_cancel],
             "FINAL": [self.btn_replay, self.btn_again, self.btn_tomenu, self.btn_exit],
@@ -803,30 +992,115 @@ class PoseBattle:
         return [sum(r["scores"][i] for r in self.results) for i in range(2)]
 
     # ---------- layar ----------
+    def queue(self, fn, btn):
+        """Jalankan aksi tombol setelah animasi klik (0,28 detik)."""
+        btn.press_t = time.time()
+        self.pending = (fn, time.time() + 0.28)
+
+    def s_splash(self, frame):
+        img = self.sky.draw()
+        t = time.time() - self.splash_t0
+        cx, cy = W // 2, 220
+        p = ease_back((t - 0.1) / 0.9)                           # logo membesar sambil berputar
+        rot = -math.radians(200) * (1 - min(1.0, t / 1.0))
+        if t > 1.2:                                               # cincin berdenyut
+            k = ((t - 1.2) % 2.0) / 2.0
+            cv2.circle(img, (cx, cy), int(95 * (1 + 0.5 * k)), GOLDC, 4, cv2.LINE_AA)
+        draw_logo(img, cx, cy, int(95 * p), rot)
+
+        word, scale, th = "POSE BATTLE", 2.8, 6                  # huruf muncul satu per satu
+        widths = [cv2.getTextSize(ch, FONT, scale, th)[0][0] for ch in word]
+        x = W // 2 - sum(widths) // 2
+        for i, ch in enumerate(word):
+            k = ease_back((t - (0.5 + 0.08 * i)) / 0.5)
+            if t >= 0.5 + 0.08 * i and ch != " ":
+                title_text(img, ch, 0, 420 + (1 - k) * 60, scale, GOLDC if i >= 5 else (255, 255, 255),
+                           th, False, x)
+            x += widths[i]
+
+        if t > 1.6:
+            k = (t - 1.6) / 0.6
+            cv2.putText(img, "Tiru gayanya, rebut skornya!", (W // 2 - 270, 505), FONT, 1.0,
+                        lerp_c((255, 215, 150), NAVY, k), 2, cv2.LINE_AA)
+        pill(img, W // 2 - 210, 560, 420, 20, (255, 255, 255))
+        prog = min(1.0, max(0.0, (t - 0.5) / 2.8))
+        if prog > 0.03:
+            pill(img, W // 2 - 207, 563, int(414 * prog), 14, GOLDC)
+        cv2.putText(img, "Klik untuk lewati", (W // 2 - 100, 615), FONT, 0.6, NAVY, 1, cv2.LINE_AA)
+
+        if t > 3.8 or self.click:
+            self.state = "MENU"
+        return img
+
     def s_menu(self, frame):
-        screen = (frame * 0.35).astype(np.uint8)
-        put(screen, "POSE BATTLE", (W // 2, 180), 3.0, GOLD, 5, True)
-        put(screen, f"Adu gerakan 2 pemain! {POSE_TIME} detik per pose.",
-            (W // 2, 275), 0.9, (255, 255, 255), 2, True)
-        put(screen, "Pemain 1 berdiri di KIRI, Pemain 2 di KANAN. Mundur sampai seluruh badan (kepala sampai kaki) terlihat.",
-            (W // 2, 320), 0.7, (220, 220, 220), 1, True)
+        img = self.sky.draw()
+        draw_logo(img, W // 2, 105, 58)
+        title_pose_battle(img, 225, 2.6, 5)
         if self.nrounds == 0:
-            put(screen, f"Belum ada gambar pose! Taruh gambar di folder '{POSE_DIR}' lalu jalankan ulang.",
-                (W // 2, 365), 0.7, (80, 80, 255), 2, True)
+            cv2.putText(img, f"Belum ada gambar pose! Taruh gambar di folder '{POSE_DIR}'.",
+                        (W // 2 - 400, 290), FONT, 0.8, (40, 40, 198), 2, cv2.LINE_AA)
         else:
-            put(screen, f"Gambar pose terbaca: {len(self.refs)} (tiap game {self.nrounds} gerakan acak)",
-                (W // 2, 365), 0.7, (0, 255, 0), 1, True)
+            cv2.putText(img, f"{len(self.refs)} gambar pose | tiap game {self.nrounds} gerakan acak",
+                        (W // 2 - 280, 285), FONT, 0.7, NAVY, 1, cv2.LINE_AA)
+        for b in (self.btn_play, self.btn_settings, self.btn_quit):
+            b.draw(img, self.mouse)
         if not SENSOR_ON:
-            put(screen, "MODE TEST: sensor mati, skor acak", (W // 2, 700), 0.7, (0, 165, 255), 2, True)
-        self.btn_play.draw(screen, self.mouse)
-        self.btn_quit.draw(screen, self.mouse)
+            cv2.putText(img, "MODE TEST: sensor mati, skor acak", (W // 2 - 210, 690),
+                        FONT, 0.7, (0, 110, 230), 2, cv2.LINE_AA)
         if self.click:
             if self.btn_play.hit(self.click):
-                self.begin_play()
+                self.queue(self.begin_play, self.btn_play)
+            elif self.btn_settings.hit(self.click):
+                self.queue(lambda: setattr(self, "state", "SETTINGS"), self.btn_settings)
             elif self.btn_quit.hit(self.click):
-                self.quit = True
-        return screen
+                self.queue(lambda: setattr(self, "quit", True), self.btn_quit)
+        return img
 
+    def draw_switch(self, img, key, on, x, y):
+        """Saklar ON/OFF: bulatan meluncur dengan efek memantul, warna berganti halus."""
+        tgt = 1.0 if on else 0.0
+        pv = self.sw_p.setdefault(key, [tgt, 0.0])
+        pv[1] = (pv[1] + (tgt - pv[0]) * 0.30) * 0.68            # pegas -> sedikit memantul
+        pv[0] += pv[1]
+        p = pv[0]
+        pill(img, x, y, 132, 64, lerp_c(GRAY_OFF, GREEN_ON, p), NAVY, 4)
+        kx = int(x + 34 + 64 * p)
+        cv2.circle(img, (kx, y + 35), 24, (120, 90, 60), -1, cv2.LINE_AA)
+        cv2.circle(img, (kx, y + 32), 24, (255, 255, 255), -1, cv2.LINE_AA)
+        if on:
+            cv2.putText(img, "ON", (x + 20, y + 42), FONT, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        else:
+            cv2.putText(img, "OFF", (x + 66, y + 42), FONT, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+    def s_settings(self, frame):
+        img = self.sky.draw()
+        title_text(img, "PENGATURAN", W // 2, 120, 2.2, (255, 255, 255), 5)
+        a = self.audio
+        cx0, cy0, cw, ch = W // 2 - 310, 200, 620, 250
+        fill_round(img, cx0, cy0 + 10, cw, ch, 46, NAVY)
+        fill_round(img, cx0, cy0, cw, ch, 46, (255, 255, 255))
+        fill_round(img, cx0 + 5, cy0 + 5, cw - 10, ch - 10, 41, (255, 248, 240))
+        for x in range(cx0 + 40, cx0 + cw - 40, 24):
+            cv2.line(img, (x, cy0 + 125), (x + 12, cy0 + 125), (242, 203, 156), 3)
+        for i, (lab, on, btn, key) in enumerate((("Musik", a.music_on, self.btn_music, "music"),
+                                                  ("Efek Suara", a.sfx_on, self.btn_sfx, "sfx"))):
+            cv2.putText(img, lab, (cx0 + 50, cy0 + 87 + i * 100), FONT, 1.3, NAVY, 2, cv2.LINE_AA)
+            self.draw_switch(img, key, on, btn.x, btn.y)
+        if not a.ok:
+            cv2.putText(img, "Suara tidak aktif (pygame belum terpasang atau SOUND_ON = False)",
+                        (W // 2 - 400, 660), FONT, 0.6, (40, 40, 198), 1, cv2.LINE_AA)
+        self.btn_setback.draw(img, self.mouse)
+        if self.click:
+            if self.btn_music.hit(self.click):
+                a.set_music_on(not a.music_on)
+                save_settings(a.music_on, a.sfx_on)
+            elif self.btn_sfx.hit(self.click):
+                a.set_sfx_on(not a.sfx_on)
+                save_settings(a.music_on, a.sfx_on)
+            elif self.btn_setback.hit(self.click):
+                self.queue(lambda: setattr(self, "state", "MENU"), self.btn_setback)
+        return img
+    
     def s_names(self, frame):
         screen = (frame * 0.35).astype(np.uint8)
         put(screen, "MASUKKAN NAMA PEMAIN", (W // 2, 110), 1.8, GOLD, 3, True)
@@ -963,7 +1237,7 @@ class PoseBattle:
             for i in range(2):
                 p = players[i]
                 self.buf[i].append(0.0 if p is None else
-                                   similarity(ref["kp"], ref["conf"], p["kp"], p["conf"]))
+                                   similarity(ref["kp"], ref["conf"], p["kp"], p["conf"], ref["base"]))
 
         if remain <= 0:                         # JEPRET + hitung skor
             self.audio.stop_sfx()               # hentikan suara 5 detik
@@ -1099,11 +1373,25 @@ class PoseBattle:
             if self.click and self.click_on_button():
                 self.audio.play("klik")           # suara tekan tombol
 
+            if self.pending:                       # tunggu animasi klik selesai, abaikan klik lain
+                self.click = None
+                if time.time() >= self.pending[1]:
+                    fn = self.pending[0]
+                    self.pending = None
+                    fn()
+            if self.state != self.last_state:
+                self.last_state = self.state
+                self.enter_t = time.time()
+
             st = self.state
-            if st == "MENU":
+            if st == "SPLASH":
+                screen = self.s_splash(frame)
+            elif st == "MENU":
                 screen = self.s_menu(frame)
             elif st == "NAMES":
                 screen = self.s_names(frame)
+            elif st == "SETTINGS":
+                screen = self.s_settings(frame)
             elif st == "WAIT":
                 screen = self.s_wait(frame)
             elif st == "COUNTDOWN":
@@ -1123,6 +1411,19 @@ class PoseBattle:
             if st in ("COUNTDOWN", "POSE", "RESULT"):
                 self.record(screen)
 
+            el = time.time() - self.enter_t
+            if st in ("SPLASH", "MENU", "SETTINGS") and el < 0.35:
+                shade(screen, 0, 0, W, H, (255, 255, 255), 0.9 * (1 - el / 0.35))
+
+            try:
+                _, _, ww, wh = cv2.getWindowImageRect(WIN)
+                if ww > 0 and wh > 0:
+                    self.disp = (ww, wh)
+                    if (ww, wh) != (W, H):
+                        screen = cv2.resize(screen, (ww, wh), interpolation=(
+                            cv2.INTER_LANCZOS4 if ww * wh > W * H else cv2.INTER_AREA))
+            except Exception:
+                pass
             cv2.imshow(WIN, screen)
             key = cv2.waitKey(1) & 0xFF
 
